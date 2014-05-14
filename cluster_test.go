@@ -28,9 +28,9 @@ package mgo_test
 
 import (
 	"fmt"
+	"github.com/bububa/bson"
+	"github.com/bububa/mgo"
 	"io"
-	"labix.org/v2/mgo"
-	"labix.org/v2/mgo/bson"
 	. "launchpad.net/gocheck"
 	"net"
 	"strings"
@@ -830,6 +830,75 @@ func (s *S) TestDialWithTimeout(c *C) {
 	c.Assert(started.After(time.Now().Add(-timeout*2)), Equals, true)
 }
 
+func (s *S) TestSocketTimeout(c *C) {
+	if *fast {
+		c.Skip("-fast")
+	}
+
+	session, err := mgo.Dial("localhost:40001")
+	c.Assert(err, IsNil)
+	defer session.Close()
+
+	s.Freeze("localhost:40001")
+
+	timeout := 3 * time.Second
+	session.SetSocketTimeout(timeout)
+	started := time.Now()
+
+	// Do something.
+	result := struct{ Ok bool }{}
+	err = session.Run("getLastError", &result)
+	c.Assert(err, ErrorMatches, ".*: i/o timeout")
+	c.Assert(started.Before(time.Now().Add(-timeout)), Equals, true)
+	c.Assert(started.After(time.Now().Add(-timeout*2)), Equals, true)
+}
+
+func (s *S) TestSocketTimeoutOnDial(c *C) {
+	if *fast {
+		c.Skip("-fast")
+	}
+
+	timeout := 1 * time.Second
+
+	defer mgo.HackSyncSocketTimeout(timeout)()
+
+	s.Freeze("localhost:40001")
+
+	started := time.Now()
+
+	session, err := mgo.DialWithTimeout("localhost:40001", timeout)
+	c.Assert(err, ErrorMatches, "no reachable servers")
+	c.Assert(session, IsNil)
+
+	c.Assert(started.Before(time.Now().Add(-timeout)), Equals, true)
+	c.Assert(started.After(time.Now().Add(-20*time.Second)), Equals, true)
+}
+
+func (s *S) TestSocketTimeoutOnInactiveSocket(c *C) {
+	if *fast {
+		c.Skip("-fast")
+	}
+
+	session, err := mgo.Dial("localhost:40001")
+	c.Assert(err, IsNil)
+	defer session.Close()
+
+	timeout := 2 * time.Second
+	session.SetSocketTimeout(timeout)
+
+	// Do something that relies on the timeout and works.
+	c.Assert(session.Ping(), IsNil)
+
+	// Freeze and wait for the timeout to go by.
+	s.Freeze("localhost:40001")
+	time.Sleep(timeout + 500*time.Millisecond)
+	s.Thaw("localhost:40001")
+
+	// Do something again. The timeout above should not have killed
+	// the socket as there was nothing to be done.
+	c.Assert(session.Ping(), IsNil)
+}
+
 func (s *S) TestDirect(c *C) {
 	session, err := mgo.Dial("localhost:40012?connect=direct")
 	c.Assert(err, IsNil)
@@ -898,6 +967,21 @@ func (s *S) TestDirectToUnknownStateMember(c *C) {
 	err = session.Run("serverStatus", result)
 	c.Assert(err, IsNil)
 	c.Assert(strings.HasSuffix(result.Host, ":40041"), Equals, true)
+}
+
+func (s *S) TestFailFast(c *C) {
+	info := mgo.DialInfo{
+		Addrs:    []string{"localhost:99999"},
+		Timeout:  5 * time.Second,
+		FailFast: true,
+	}
+
+	started := time.Now()
+
+	_, err := mgo.DialWithInfo(&info)
+	c.Assert(err, ErrorMatches, "no reachable servers")
+
+	c.Assert(started.After(time.Now().Add(-time.Second)), Equals, true)
 }
 
 type OpCounters struct {
@@ -1147,7 +1231,7 @@ func (s *S) TestSetModeEventualIterBug(c *C) {
 	c.Assert(i, Equals, N)
 }
 
-func (s *S) TestCustomDial(c *C) {
+func (s *S) TestCustomDialOld(c *C) {
 	dials := make(chan bool, 16)
 	dial := func(addr net.Addr) (net.Conn, error) {
 		tcpaddr, ok := addr.(*net.TCPAddr)
@@ -1160,6 +1244,40 @@ func (s *S) TestCustomDial(c *C) {
 	info := mgo.DialInfo{
 		Addrs: []string{"localhost:40012"},
 		Dial:  dial,
+	}
+
+	// Use hostname here rather than IP, to make things trickier.
+	session, err := mgo.DialWithInfo(&info)
+	c.Assert(err, IsNil)
+	defer session.Close()
+
+	const N = 3
+	for i := 0; i < N; i++ {
+		select {
+		case <-dials:
+		case <-time.After(5 * time.Second):
+			c.Fatalf("expected %d dials, got %d", N, i)
+		}
+	}
+	select {
+	case <-dials:
+		c.Fatalf("got more dials than expected")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func (s *S) TestCustomDialNew(c *C) {
+	dials := make(chan bool, 16)
+	dial := func(addr *mgo.ServerAddr) (net.Conn, error) {
+		dials <- true
+		if addr.TCPAddr().Port == 40012 {
+			c.Check(addr.String(), Equals, "localhost:40012")
+		}
+		return net.DialTCP("tcp", nil, addr.TCPAddr())
+	}
+	info := mgo.DialInfo{
+		Addrs:      []string{"localhost:40012"},
+		DialServer: dial,
 	}
 
 	// Use hostname here rather than IP, to make things trickier.
@@ -1300,7 +1418,7 @@ func (s *S) TestNearestSecondary(c *C) {
 }
 
 func (s *S) TestConnectCloseConcurrency(c *C) {
-	restore := mgo.HackPingDelay(1)
+	restore := mgo.HackPingDelay(500 * time.Millisecond)
 	defer restore()
 	var wg sync.WaitGroup
 	const n = 500
@@ -1417,17 +1535,17 @@ func (s *S) TestSelectServersWithMongos(c *C) {
 
 	switch hostPort(master) {
 	case "40021":
-		c.Check(opc21b.Query - opc21a.Query, Equals, 0)
-		c.Check(opc22b.Query - opc22a.Query, Equals, 5)
-		c.Check(opc23b.Query - opc23a.Query, Equals, 7)
+		c.Check(opc21b.Query-opc21a.Query, Equals, 0)
+		c.Check(opc22b.Query-opc22a.Query, Equals, 5)
+		c.Check(opc23b.Query-opc23a.Query, Equals, 7)
 	case "40022":
-		c.Check(opc21b.Query - opc21a.Query, Equals, 5)
-		c.Check(opc22b.Query - opc22a.Query, Equals, 0)
-		c.Check(opc23b.Query - opc23a.Query, Equals, 7)
+		c.Check(opc21b.Query-opc21a.Query, Equals, 5)
+		c.Check(opc22b.Query-opc22a.Query, Equals, 0)
+		c.Check(opc23b.Query-opc23a.Query, Equals, 7)
 	case "40023":
-		c.Check(opc21b.Query - opc21a.Query, Equals, 5)
-		c.Check(opc22b.Query - opc22a.Query, Equals, 7)
-		c.Check(opc23b.Query - opc23a.Query, Equals, 0)
+		c.Check(opc21b.Query-opc21a.Query, Equals, 5)
+		c.Check(opc22b.Query-opc22a.Query, Equals, 7)
+		c.Check(opc23b.Query-opc23a.Query, Equals, 0)
 	default:
 		c.Fatal("Uh?")
 	}

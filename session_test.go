@@ -29,8 +29,8 @@ package mgo_test
 import (
 	"flag"
 	"fmt"
-	"labix.org/v2/mgo"
-	"labix.org/v2/mgo/bson"
+	"github.com/bububa/bson"
+	"github.com/bububa/mgo"
 	. "launchpad.net/gocheck"
 	"math"
 	"reflect"
@@ -741,6 +741,8 @@ func (s *S) TestIsDupValues(c *C) {
 	c.Assert(mgo.IsDup(&mgo.QueryError{Code: 11001}), Equals, true)
 	c.Assert(mgo.IsDup(&mgo.LastError{Code: 12582}), Equals, true)
 	c.Assert(mgo.IsDup(&mgo.QueryError{Code: 12582}), Equals, true)
+	lerr := &mgo.LastError{Code: 16460, Err: "error inserting 1 documents to shard ... caused by :: E11000 duplicate key error index: ..."}
+	c.Assert(mgo.IsDup(lerr), Equals, true)
 }
 
 func (s *S) TestIsDupPrimary(c *C) {
@@ -2850,6 +2852,29 @@ func (s *S) TestMapReduceToOtherDb(c *C) {
 	c.Assert(iter.Close(), IsNil)
 }
 
+func (s *S) TestMapReduceOutOfOrder(c *C) {
+	session, err := mgo.Dial("localhost:40001")
+	c.Assert(err, IsNil)
+	defer session.Close()
+
+	coll := session.DB("mydb").C("mycoll")
+
+	for _, i := range []int{1, 4, 6, 2, 2, 3, 4} {
+		coll.Insert(M{"n": i})
+	}
+
+	job := &mgo.MapReduce{
+		Map:    "function() { emit(this.n, 1); }",
+		Reduce: "function(key, values) { return Array.sum(values); }",
+		Out:    bson.M{"a": "a", "z": "z", "replace": "mr", "db": "otherdb", "b": "b", "y": "y"},
+	}
+
+	info, err := coll.Find(nil).MapReduce(job, nil)
+	c.Assert(err, IsNil)
+	c.Assert(info.Collection, Equals, "mr")
+	c.Assert(info.Database, Equals, "otherdb")
+}
+
 func (s *S) TestMapReduceScope(c *C) {
 	session, err := mgo.Dial("localhost:40001")
 	c.Assert(err, IsNil)
@@ -2878,7 +2903,10 @@ func (s *S) TestMapReduceVerbose(c *C) {
 
 	coll := session.DB("mydb").C("mycoll")
 
-	coll.Insert(M{"n": 1})
+	for i := 0; i < 100; i++ {
+		err = coll.Insert(M{"n": i})
+		c.Assert(err, IsNil)
+	}
 
 	job := &mgo.MapReduce{
 		Map:     "function() { emit(this.n, 1); }",
@@ -3143,7 +3171,8 @@ func (s *S) TestFindIterCloseKillsCursor(c *C) {
 	coll := session.DB("mydb").C("mycoll")
 	ns := []int{40, 41, 42, 43, 44, 45, 46}
 	for _, n := range ns {
-		coll.Insert(M{"n": n})
+		err = coll.Insert(M{"n": n})
+		c.Assert(err, IsNil)
 	}
 
 	iter := coll.Find(nil).Batch(2).Iter()
@@ -3160,10 +3189,30 @@ func (s *S) TestLogReplay(c *C) {
 
 	coll := session.DB("mydb").C("mycoll")
 	for i := 0; i < 5; i++ {
-		coll.Insert(M{"ts": time.Now()})
+		err = coll.Insert(M{"ts": time.Now()})
+		c.Assert(err, IsNil)
 	}
 
 	iter := coll.Find(nil).LogReplay().Iter()
 	c.Assert(iter.Next(bson.M{}), Equals, false)
 	c.Assert(iter.Err(), ErrorMatches, "no ts field in query")
+}
+
+func (s *S) TestSetCursorTimeout(c *C) {
+	session, err := mgo.Dial("localhost:40001")
+	c.Assert(err, IsNil)
+	defer session.Close()
+
+	coll := session.DB("mydb").C("mycoll")
+	err = coll.Insert(M{"n": 42})
+
+	// This is just a smoke test. Won't wait 10 minutes for an actual timeout.
+
+	session.SetCursorTimeout(0)
+
+	var result struct{ N int }
+	iter := coll.Find(nil).Iter()
+	c.Assert(iter.Next(&result), Equals, true)
+	c.Assert(result.N, Equals, 42)
+	c.Assert(iter.Next(&result), Equals, false)
 }

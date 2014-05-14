@@ -63,6 +63,7 @@ type Session struct {
 	queryConfig  query
 	safeOp       *queryOp
 	syncTimeout  time.Duration
+	sockTimeout  time.Duration
 	defaultdb    string
 	dialAuth     *authInfo
 	auth         []authInfo
@@ -126,8 +127,8 @@ const defaultPrefetch = 0.25
 //
 // Dial will timeout after 10 seconds if a server isn't reached. The returned
 // session will timeout operations after one minute by default if servers
-// aren't available. To customize the timeout, see DialWithTimeout
-// and SetSyncTimeout.
+// aren't available. To customize the timeout, see DialWithTimeout,
+// SetSyncTimeout, and SetSocketTimeout.
 //
 // This method is generally called just once for a given cluster.  Further
 // sessions to the same cluster are then established using the New or Copy
@@ -174,7 +175,8 @@ const defaultPrefetch = 0.25
 func Dial(url string) (*Session, error) {
 	session, err := DialWithTimeout(url, 10*time.Second)
 	if err == nil {
-		session.SetSyncTimeout(time.Minute)
+		session.SetSyncTimeout(1 * time.Minute)
+		session.SetSocketTimeout(1 * time.Minute)
 	}
 	return session, err
 }
@@ -234,6 +236,13 @@ type DialInfo struct {
 	// to be established.
 	Timeout time.Duration
 
+	// FailFast will cause connection and query attempts to fail faster when
+	// the server is unavailable, instead of retrying until the configured
+	// timeout period. Note that an unavailable server may silently drop
+	// packets instead of rejecting them, in which case it's impossible to
+	// distinguish it from a slow server, so the timeout stays relevant.
+	FailFast bool
+
 	// Database is the database name used during the initial authentication.
 	// If set, the value is also returned as the default result from the
 	// Session.DB method, in place of "test".
@@ -245,10 +254,29 @@ type DialInfo struct {
 	Username string
 	Password string
 
-	// Dial optionally specifies the dial function for creating connections.
-	// At the moment addr will have type *net.TCPAddr, but other types may
-	// be provided in the future, so check and fail if necessary.
+	// DialServer optionally specifies the dial function for establishing
+	// connections with the MongoDB servers.
+	DialServer func(addr *ServerAddr) (net.Conn, error)
+
+	// WARNING: This field is obsolete. See DialServer above.
 	Dial func(addr net.Addr) (net.Conn, error)
+}
+
+// ServerAddr represents the address for establishing a connection to an
+// individual MongoDB server.
+type ServerAddr struct {
+	str string
+	tcp *net.TCPAddr
+}
+
+// String returns the address that was provided for the server before resolution.
+func (addr *ServerAddr) String() string {
+	return addr.str
+}
+
+// TCPAddr returns the resolved TCP address for the server.
+func (addr *ServerAddr) TCPAddr() *net.TCPAddr {
+	return addr.tcp
 }
 
 // DialWithInfo establishes a new session to the cluster identified by info.
@@ -262,7 +290,7 @@ func DialWithInfo(info *DialInfo) (*Session, error) {
 		}
 		addrs[i] = addr
 	}
-	cluster := newCluster(addrs, info.Direct, info.Dial)
+	cluster := newCluster(addrs, info.Direct, info.FailFast, dialer{info.Dial, info.DialServer})
 	session := newSession(Eventual, cluster, info.Timeout)
 	session.defaultdb = info.Database
 	if session.defaultdb == "" {
@@ -334,9 +362,9 @@ func parseURL(url string) (*urlInfo, error) {
 	return info, nil
 }
 
-func newSession(consistency mode, cluster *mongoCluster, syncTimeout time.Duration) (session *Session) {
+func newSession(consistency mode, cluster *mongoCluster, timeout time.Duration) (session *Session) {
 	cluster.Acquire()
-	session = &Session{cluster_: cluster, syncTimeout: syncTimeout}
+	session = &Session{cluster_: cluster, syncTimeout: timeout, sockTimeout: timeout}
 	debugf("New session %p on cluster %p", session, cluster)
 	session.SetMode(consistency, true)
 	session.SetSafe(&Safe{})
@@ -476,7 +504,8 @@ func (db *Database) Login(user, pass string) (err error) {
 	}
 	defer socket.Release()
 
-	err = socket.Login(dbname, user, pass)
+	auth := authInfo{dbname, user, pass}
+	err = socket.Login(auth)
 	if err != nil {
 		return err
 	}
@@ -491,13 +520,13 @@ func (db *Database) Login(user, pass string) (err error) {
 			return nil
 		}
 	}
-	session.auth = append(session.auth, authInfo{dbname, user, pass})
+	session.auth = append(session.auth, auth)
 	return nil
 }
 
 func (s *Session) socketLogin(socket *mongoSocket) error {
-	for _, a := range s.auth {
-		if err := socket.Login(a.db, a.user, a.pass); err != nil {
+	for _, auth := range s.auth {
+		if err := socket.Login(auth); err != nil {
 			return err
 		}
 	}
@@ -593,7 +622,7 @@ const (
 	RoleDBAdmin      Role = "dbAdmin"
 	RoleDBAdminAny   Role = "dbAdminAnyDatabase"
 	RoleUserAdmin    Role = "userAdmin"
-	RoleUserAdminAny Role = "UserAdminAnyDatabase"
+	RoleUserAdminAny Role = "userAdminAnyDatabase"
 	RoleClusterAdmin Role = "clusterAdmin"
 )
 
@@ -976,7 +1005,7 @@ func (s *Session) ResetIndexCache() {
 
 // New creates a new session with the same parameters as the original
 // session, including consistency, batch size, prefetching, safety mode,
-// etc. The returned session will use sockets from the poll, so there's
+// etc. The returned session will use sockets from the pool, so there's
 // a chance that writes just performed in another session may not yet
 // be visible.
 //
@@ -1116,6 +1145,33 @@ func (s *Session) Mode() mode {
 func (s *Session) SetSyncTimeout(d time.Duration) {
 	s.m.Lock()
 	s.syncTimeout = d
+	s.m.Unlock()
+}
+
+// SetSocketTimeout sets the amount of time to wait for a non-responding
+// socket to the database before it is forcefully closed.
+func (s *Session) SetSocketTimeout(d time.Duration) {
+	s.m.Lock()
+	s.sockTimeout = d
+	if s.masterSocket != nil {
+		s.masterSocket.SetTimeout(d)
+	}
+	if s.slaveSocket != nil {
+		s.slaveSocket.SetTimeout(d)
+	}
+	s.m.Unlock()
+}
+
+// SetCursorTimeout changes the standard timeout period that the server
+// enforces on created cursors. The only supported value right now is
+// 0, which disables the timeout. The standard server timeout is 10 minutes.
+func (s *Session) SetCursorTimeout(d time.Duration) {
+	s.m.Lock()
+	if d == 0 {
+		s.queryConfig.op.flags |= flagNoCursorTimeout
+	} else {
+		panic("SetCursorTimeout: only 0 (disable timeout) supported for now")
+	}
 	s.m.Unlock()
 }
 
@@ -1565,11 +1621,11 @@ func (err *QueryError) Error() string {
 // a primary key index or a secondary unique index already has an entry
 // with the given value.
 func IsDup(err error) bool {
-	// Besides being handy, helps with https://jira.mongodb.org/browse/SERVER-7164
+	// Besides being handy, helps with MongoDB bugs SERVER-7164 and SERVER-11493.
 	// What follows makes me sad. Hopefully conventions will be more clear over time.
 	switch e := err.(type) {
 	case *LastError:
-		return e.Code == 11000 || e.Code == 11001 || e.Code == 12582
+		return e.Code == 11000 || e.Code == 11001 || e.Code == 12582 || e.Code == 16460 && strings.Contains(e.Err, " E11000 ")
 	case *QueryError:
 		return e.Code == 11000 || e.Code == 11001 || e.Code == 12582
 	}
@@ -1586,7 +1642,7 @@ func (c *Collection) Insert(docs ...interface{}) error {
 }
 
 // Update finds a single document matching the provided selector document
-// and modifies it according to the change document.
+// and modifies it according to the update document.
 // If the session is in safe mode (see SetSafe) a ErrNotFound error is
 // returned if a document isn't found, or a value of type *LastError
 // when some other error is detected.
@@ -1596,8 +1652,8 @@ func (c *Collection) Insert(docs ...interface{}) error {
 //     http://www.mongodb.org/display/DOCS/Updating
 //     http://www.mongodb.org/display/DOCS/Atomic+Operations
 //
-func (c *Collection) Update(selector interface{}, change interface{}) error {
-	lerr, err := c.writeQuery(&updateOp{c.FullName, selector, change, 0})
+func (c *Collection) Update(selector interface{}, update interface{}) error {
+	lerr, err := c.writeQuery(&updateOp{c.FullName, selector, update, 0})
 	if err == nil && lerr != nil && !lerr.UpdatedExisting {
 		return ErrNotFound
 	}
@@ -1606,14 +1662,14 @@ func (c *Collection) Update(selector interface{}, change interface{}) error {
 
 // UpdateId is a convenience helper equivalent to:
 //
-//     err := collection.Update(bson.M{"_id": id}, change)
+//     err := collection.Update(bson.M{"_id": id}, update)
 //
 // See the Update method for more details.
-func (c *Collection) UpdateId(id interface{}, change interface{}) error {
-	return c.Update(bson.D{{"_id", id}}, change)
+func (c *Collection) UpdateId(id interface{}, update interface{}) error {
+	return c.Update(bson.D{{"_id", id}}, update)
 }
 
-// ChangeInfo holds details about the outcome of a change operation.
+// ChangeInfo holds details about the outcome of an update operation.
 type ChangeInfo struct {
 	Updated    int         // Number of existing documents updated
 	Removed    int         // Number of documents removed
@@ -1621,7 +1677,7 @@ type ChangeInfo struct {
 }
 
 // UpdateAll finds all documents matching the provided selector document
-// and modifies them according to the change document.
+// and modifies them according to the update document.
 // If the session is in safe mode (see SetSafe) details of the executed
 // operation are returned in info or an error of type *LastError when
 // some problem is detected. It is not an error for the update to not be
@@ -1632,8 +1688,8 @@ type ChangeInfo struct {
 //     http://www.mongodb.org/display/DOCS/Updating
 //     http://www.mongodb.org/display/DOCS/Atomic+Operations
 //
-func (c *Collection) UpdateAll(selector interface{}, change interface{}) (info *ChangeInfo, err error) {
-	lerr, err := c.writeQuery(&updateOp{c.FullName, selector, change, 2})
+func (c *Collection) UpdateAll(selector interface{}, update interface{}) (info *ChangeInfo, err error) {
+	lerr, err := c.writeQuery(&updateOp{c.FullName, selector, update, 2})
 	if err == nil && lerr != nil {
 		info = &ChangeInfo{Updated: lerr.N}
 	}
@@ -1641,8 +1697,8 @@ func (c *Collection) UpdateAll(selector interface{}, change interface{}) (info *
 }
 
 // Upsert finds a single document matching the provided selector document
-// and modifies it according to the change document.  If no document matching
-// the selector is found, the change document is applied to the selector
+// and modifies it according to the update document.  If no document matching
+// the selector is found, the update document is applied to the selector
 // document and the result is inserted in the collection.
 // If the session is in safe mode (see SetSafe) details of the executed
 // operation are returned in info, or an error of type *LastError when
@@ -1653,13 +1709,13 @@ func (c *Collection) UpdateAll(selector interface{}, change interface{}) (info *
 //     http://www.mongodb.org/display/DOCS/Updating
 //     http://www.mongodb.org/display/DOCS/Atomic+Operations
 //
-func (c *Collection) Upsert(selector interface{}, change interface{}) (info *ChangeInfo, err error) {
-	data, err := bson.Marshal(change)
+func (c *Collection) Upsert(selector interface{}, update interface{}) (info *ChangeInfo, err error) {
+	data, err := bson.Marshal(update)
 	if err != nil {
 		return nil, err
 	}
-	change = bson.Raw{0x03, data}
-	lerr, err := c.writeQuery(&updateOp{c.FullName, selector, change, 1})
+	update = bson.Raw{0x03, data}
+	lerr, err := c.writeQuery(&updateOp{c.FullName, selector, update, 1})
 	if err == nil && lerr != nil {
 		info = &ChangeInfo{}
 		if lerr.UpdatedExisting {
@@ -1673,11 +1729,11 @@ func (c *Collection) Upsert(selector interface{}, change interface{}) (info *Cha
 
 // UpsertId is a convenience helper equivalent to:
 //
-//     info, err := collection.Upsert(bson.M{"_id": id}, change)
+//     info, err := collection.Upsert(bson.M{"_id": id}, update)
 //
 // See the Upsert method for more details.
-func (c *Collection) UpsertId(id interface{}, change interface{}) (info *ChangeInfo, err error) {
-	return c.Upsert(bson.D{{"_id", id}}, change)
+func (c *Collection) UpsertId(id interface{}, update interface{}) (info *ChangeInfo, err error) {
+	return c.Upsert(bson.D{{"_id", id}}, update)
 }
 
 // Remove finds a single document matching the provided selector document
@@ -1893,6 +1949,7 @@ func (q *Query) Select(selector interface{}) *Query {
 //     http://www.mongodb.org/display/DOCS/Sorting+and+Natural+Order
 //
 func (q *Query) Sort(fields ...string) *Query {
+	// TODO //     query4 := collection.Find(nil).Sort("score:{$meta:textScore}")
 	q.m.Lock()
 	var order bson.D
 	for _, field := range fields {
@@ -2234,8 +2291,14 @@ func (q *Query) Iter() *Iter {
 	if err != nil {
 		iter.err = err
 	} else {
-		iter.err = socket.Query(&op)
 		iter.server = socket.Server()
+		err = socket.Query(&op)
+		if err != nil {
+			// Must lock as the query above may call replyFunc.
+			iter.m.Lock()
+			iter.err = err
+			iter.m.Unlock()
+		}
 		socket.Release()
 	}
 	return iter
@@ -2308,8 +2371,14 @@ func (q *Query) Tail(timeout time.Duration) *Iter {
 	if err != nil {
 		iter.err = err
 	} else {
-		iter.err = socket.Query(&op)
 		iter.server = socket.Server()
+		err = socket.Query(&op)
+		if err != nil {
+			// Must lock as the query above may call replyFunc.
+			iter.m.Lock()
+			iter.err = err
+			iter.m.Unlock()
+		}
 		socket.Release()
 	}
 	return iter
@@ -2441,10 +2510,12 @@ func (iter *Iter) Next(result interface{}) bool {
 			iter.limit--
 			if iter.limit == 0 {
 				if iter.docData.Len() > 0 {
+					iter.m.Unlock()
 					panic(fmt.Errorf("data remains after limit exhausted: %d", iter.docData.Len()))
 				}
 				iter.err = ErrNotFound
 				if iter.killCursor() != nil {
+					iter.m.Unlock()
 					return false
 				}
 			}
@@ -2459,7 +2530,11 @@ func (iter *Iter) Next(result interface{}) bool {
 		err := bson.Unmarshal(docData, result)
 		if err != nil {
 			debugf("Iter %p document unmarshaling failed: %#v", iter, err)
-			iter.err = err
+			iter.m.Lock()
+			if iter.err == nil {
+				iter.err = err
+			}
+			iter.m.Unlock()
 			return false
 		}
 		debugf("Iter %p document unmarshaled: %#v", iter, result)
@@ -2586,8 +2661,11 @@ func (iter *Iter) acquireSocket() (*mongoSocket, error) {
 		// with Eventual sessions, if a Refresh is done, or if a
 		// monotonic session gets a write and shifts from secondary
 		// to primary. Our cursor is in a specific server, though.
+		iter.session.m.Lock()
+		sockTimeout := iter.session.sockTimeout
+		iter.session.m.Unlock()
 		socket.Release()
-		socket, _, err = iter.server.AcquireSocket(0)
+		socket, _, err = iter.server.AcquireSocket(0, sockTimeout)
 		if err != nil {
 			return nil, err
 		}
@@ -2822,7 +2900,7 @@ func (q *Query) MapReduce(job *MapReduce, result interface{}) (info *MapReduceIn
 		Map:        job.Map,
 		Reduce:     job.Reduce,
 		Finalize:   job.Finalize,
-		Out:        job.Out,
+		Out:        fixMROut(job.Out),
 		Scope:      job.Scope,
 		Verbose:    job.Verbose,
 		Query:      op.query,
@@ -2876,8 +2954,40 @@ func (q *Query) MapReduce(job *MapReduce, result interface{}) (info *MapReduceIn
 	return info, nil
 }
 
+// The "out" option in the MapReduce command must be ordered. This was
+// found after the implementation was accepting maps for a long time,
+// so rather than breaking the API, we'll fix the order if necessary.
+// Details about the order requirement may be seen in MongoDB's code:
+//
+//     http://goo.gl/L8jwJX
+//
+func fixMROut(out interface{}) interface{} {
+	outv := reflect.ValueOf(out)
+	if outv.Kind() != reflect.Map || outv.Type().Key() != reflect.TypeOf("") {
+		return out
+	}
+	outs := make(bson.D, outv.Len())
+
+	outTypeIndex := -1
+	for i, k := range outv.MapKeys() {
+		ks := k.String()
+		outs[i].Name = ks
+		outs[i].Value = outv.MapIndex(k).Interface()
+		switch ks {
+		case "normal", "replace", "merge", "reduce", "inline":
+			outTypeIndex = i
+		}
+	}
+	if outTypeIndex > 0 {
+		outs[0], outs[outTypeIndex] = outs[outTypeIndex], outs[0]
+	}
+	return outs
+}
+
+// Change holds fields for running a findAndModify MongoDB command via
+// the Query.Apply method.
 type Change struct {
-	Update    interface{} // The change document
+	Update    interface{} // The update document
 	Upsert    bool        // Whether to insert in case the document isn't found
 	Remove    bool        // Whether to remove the document found rather than updating
 	ReturnNew bool        // Should the modified document be returned rather than the old one
@@ -2894,10 +3004,10 @@ type valueResult struct {
 	LastError LastError "lastErrorObject"
 }
 
-// Apply allows updating, upserting or removing a document matching a query
-// and atomically returning either the old version (the default) or the new
-// version of the document (when ReturnNew is true). If no objects are
-// found Apply returns ErrNotFound.
+// Apply runs the findAndModify MongoDB command, which allows updating, upserting
+// or removing a document matching a query and atomically returning either the old
+// version (the default) or the new version of the document (when ReturnNew is true).
+// If no objects are found Apply returns ErrNotFound.
 //
 // The Sort and Select query methods affect the result of Apply.  In case
 // multiple documents match the query, Sort enables selecting which document to
@@ -2912,6 +3022,8 @@ type valueResult struct {
 //     }
 //     info, err = col.Find(M{"_id": id}).Apply(change, &doc)
 //     fmt.Println(doc.N)
+//
+// This method depends on MongoDB >= 2.0 to work properly.
 //
 // Relevant documentation:
 //
@@ -3047,7 +3159,7 @@ func (s *Session) acquireSocket(slaveOk bool) (*mongoSocket, error) {
 	}
 
 	// Still not good.  We need a new socket.
-	sock, err := s.cluster().AcquireSocket(slaveOk && s.slaveOk, s.syncTimeout, s.queryConfig.op.serverTags)
+	sock, err := s.cluster().AcquireSocket(slaveOk && s.slaveOk, s.syncTimeout, s.sockTimeout, s.queryConfig.op.serverTags)
 	if err != nil {
 		return nil, err
 	}
