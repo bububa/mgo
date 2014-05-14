@@ -163,16 +163,34 @@ const defaultPrefetch = 0.25
 //
 //     connect=direct
 //
-//         This option will disable the automatic replica set server
-//         discovery logic, and will only use the servers provided.
-//         This enables forcing the communication with a specific
-//         server or set of servers (even if they are slaves).  Note
-//         that to talk to a slave you'll need to relax the consistency
-//         requirements using a Monotonic or Eventual mode via SetMode.
+//         Disables the automatic replica set server discovery logic, and
+//         forces the use of servers provided only (even if secondaries).
+//         Note that to talk to a secondary the consistency requirements
+//         must be relaxed to Monotonic or Eventual via SetMode.
+//
+//
+//     authSource=<db>
+//
+//         Informs the database used to establish credentials and privileges
+//         with a MongoDB server. Defaults to the database name provided via
+//         the URL path, and "admin" if that's unset.
+//
+//
+//     authMechanism=<mechanism>
+//
+//        Defines the protocol for credential negotiation. Defaults to "MONGODB-CR",
+//        which is the default username/password challenge-response mechanism.
+//
+//
+//     gssapiServiceName=<name>
+//
+//           Defines the service name to use when authenticating with the GSSAPI
+//           mechanism. Defaults to "mongodb".
+//
 //
 // Relevant documentation:
 //
-//     http://www.mongodb.org/display/DOCS/Connections
+//     http://docs.mongodb.org/manual/reference/connection-string/
 //
 func Dial(url string) (*Session, error) {
 	session, err := DialWithTimeout(url, 10*time.Second)
@@ -378,7 +396,7 @@ func parseURL(s string) (*urlInfo, error) {
 		for _, pair := range strings.FieldsFunc(s[c+1:], isOptSep) {
 			l := strings.SplitN(pair, "=", 2)
 			if len(l) != 2 || l[0] == "" || l[1] == "" {
-				return nil, errors.New("Connection option must be key=value: " + pair)
+				return nil, errors.New("connection option must be key=value: " + pair)
 			}
 			info.options[l[0]] = l[1]
 		}
@@ -387,7 +405,7 @@ func parseURL(s string) (*urlInfo, error) {
 	if c := strings.Index(s, "@"); c != -1 {
 		pair := strings.SplitN(s[:c], ":", 2)
 		if len(pair) > 2 || pair[0] == "" {
-			return nil, errors.New("Credentials must be provided as user:pass@host")
+			return nil, errors.New("credentials must be provided as user:pass@host")
 		}
 		var err error
 		info.user, err = url.QueryUnescape(pair[0])
@@ -831,12 +849,12 @@ func parseIndexKey(key []string) (name string, realKey bson.D, err error) {
 			}
 		}
 		if field == "" || kind != "" && order != kind {
-			return "", nil, fmt.Errorf(`Invalid index key: want "[$<kind>:][-]<field name>", got %q`, raw)
+			return "", nil, fmt.Errorf(`invalid index key: want "[$<kind>:][-]<field name>", got %q`, raw)
 		}
 		realKey = append(realKey, bson.DocElem{field, order})
 	}
 	if name == "" {
-		return "", nil, errors.New("Invalid index key: no fields provided")
+		return "", nil, errors.New("invalid index key: no fields provided")
 	}
 	return
 }

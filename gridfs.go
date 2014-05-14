@@ -281,7 +281,7 @@ func (gfs *GridFS) OpenNext(iter *Iter, file **GridFile) bool {
 		// Ignoring the error here shouldn't be a big deal
 		// as we're reading the file and the loop iteration
 		// for this file is finished.
-		_ = file.Close()
+		_ = (*file).Close()
 	}
 	var doc gfsFile
 	if !iter.Next(&doc) {
@@ -352,7 +352,7 @@ func (file *GridFile) assertMode(mode gfsFileMode) {
 	case gfsClosed:
 		panic("GridFile is closed")
 	default:
-		panic("Internal error: missing GridFile mode")
+		panic("internal error: missing GridFile mode")
 	}
 }
 
@@ -630,10 +630,10 @@ func (file *GridFile) Seek(offset int64, whence int) (pos int64, err error) {
 	case os.SEEK_END:
 		offset += file.doc.Length
 	default:
-		panic("Unsupported whence value")
+		panic("unsupported whence value")
 	}
 	if offset > file.doc.Length {
-		return file.offset, errors.New("Seek past end of file")
+		return file.offset, errors.New("seek past end of file")
 	}
 	chunk := int(offset / int64(file.doc.ChunkSize))
 	if chunk+1 == file.chunk && offset >= file.offset {
